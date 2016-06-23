@@ -1,8 +1,11 @@
+import contextlib
 from collections import namedtuple
 
+import envi
 import viv_utils
 import viv_utils.emulator_drivers
 
+import api_hooks
 from utils import makeEmulator
 
 # TODO get return address from emu_snap
@@ -25,11 +28,19 @@ class CallMonitor(viv_utils.emulator_drivers.Monitor):
     def get_contexts(self):
         return self.function_contexts
 
-#    def prehook(self, emu, op, starteip):
-#        self.d("%s: %s", hex(starteip), op)
+    def prehook(self, emu, op, starteip):
+        self.d("%s: %s", hex(starteip), op)
 
 
-# TODO LoggingObject should have its own file or be in general utils...
+@contextlib.contextmanager
+def installed_monitor(driver, monitor):
+    try:
+        driver.add_monitor(monitor)
+        yield
+    finally:
+        driver.remove_monitor(monitor)
+
+
 class FunctionArgumentGetter(viv_utils.LoggingObject):
     def __init__(self, vivisect_workspace):
         viv_utils.LoggingObject.__init__(self)
@@ -54,6 +65,17 @@ class FunctionArgumentGetter(viv_utils.LoggingObject):
         caller_function_vas = set([])
         for caller_va in self.vivisect_workspace.getCallers(function_va):
             self.d("    caller: %s" % hex(caller_va))
+
+            try:
+                op = self.vivisect_workspace.parseOpcode(caller_va)
+            except Exception as e:
+                self.d("      not a call instruction: failed to decode instruction: %s", e.message)
+                continue
+
+            if not (op.iflags & envi.IF_CALL):
+                self.d("      not a call instruction: %s", op)
+                continue
+
             try:
                 # the address of the function that contains this instruction
                 caller_function_va = self.index[caller_va]
@@ -64,26 +86,32 @@ class FunctionArgumentGetter(viv_utils.LoggingObject):
                 self.w("unknown caller function: 0x%x", caller_va)
                 continue
 
-            self.d("      function: %s" % hex(caller_function_va))
+            self.d("      function: %s", hex(caller_function_va))
             caller_function_vas.add(caller_function_va)
         return caller_function_vas
 
     def get_contexts_via_monitor(self, fva, target_fva):
-        """ run the given function while collecting arguments to a target function """
-        monitor = self.setup_monitor(target_fva)
+        """
+        run the given function while collecting arguments to a target function
+        """
+        try:
+            _ = self.index[fva]
+        except KeyError:
+            self.d("    unknown function")
+            return []
+
         self.d("    emulating: %s, watching %s" % (hex(self.index[fva]), hex(target_fva)))
-        self.driver.runFunction(self.index[fva], maxhit=1, func_only=True)
+        monitor = CallMonitor(self.vivisect_workspace, target_fva)
+        with installed_monitor(self.driver, monitor):
+            with api_hooks.defaultHooks(self.driver):
+                self.driver.runFunction(self.index[fva], maxhit=1, maxrep=0x100, func_only=True)
         contexts = monitor.get_contexts()
-        self.driver.remove_monitor(monitor)
+
         self.d("      results:")
         for c in contexts:
             self.d("        <context>")
-        return contexts
 
-    def setup_monitor(self, target_fva):
-        monitor = CallMonitor(self.vivisect_workspace, target_fva)
-        self.driver.add_monitor(monitor)
-        return monitor
+        return contexts
 
 
 def get_function_contexts(vw, fva):

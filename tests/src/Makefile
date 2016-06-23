@@ -16,7 +16,9 @@ TESTS= \
 	decode-to-stack \
 	decode-string-by-index \
 	decode-reencode-string \
-	decode-wrapped-decoder
+	decode-wrapped-decoder \
+	decode-to-stack-rep-mov \
+    decode-substitution-cipher
 
 
 clean:

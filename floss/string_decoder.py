@@ -1,15 +1,92 @@
+import re
 import logging
-
-import envi.memory
 
 import strings
 import decoding_manager
 from utils import makeEmulator
 from function_argument_getter import get_function_contexts
-from decoding_manager import DecodedString
+from decoding_manager import DecodedString, LocationType
 
 
 floss_logger = logging.getLogger("floss")
+
+
+def memdiff_search(bytes1, bytes2):
+    '''
+    Use binary searching to find the offset of the first difference
+     between two strings.
+
+    :param bytes1: The original sequence of bytes
+    :param bytes2: A sequence of bytes to compare with bytes1
+    :type bytes1: str
+    :type bytes2: str
+    :rtype: int offset of the first location a and b differ, None if strings match
+    '''
+
+    # Prevent infinite recursion on inputs with length of one
+    half = (len(bytes1) / 2) or 1
+
+    # Compare first half of the string
+    if bytes1[:half] != bytes2[:half]:
+
+        # Have we found the first diff?
+        if bytes1[0] != bytes2[0]:
+            return 0
+
+        return memdiff_search(bytes1[:half], bytes2[:half])
+
+    # Compare second half of the string
+    if bytes1[half:] != bytes2[half:]:
+        return memdiff_search(bytes1[half:], bytes2[half:]) + half
+
+
+def memdiff(bytes1, bytes2):
+    '''
+    Find all differences between two input strings.
+
+    :param bytes1: The original sequence of bytes
+    :param bytes2: The sequence of bytes to compare to
+    :type bytes1: str
+    :type bytes2: str
+    :rtype: list of (offset, length) tuples indicating locations bytes1 and
+      bytes2 differ
+    '''
+    # Shortcut matching inputs
+    if bytes1 == bytes2:
+        return []
+
+    # Verify lengths match
+    size = len(bytes1)
+    if size != len(bytes2):
+        raise Exception('memdiff *requires* same size bytes')
+
+    diffs = []
+
+    # Get position of first diff
+    diff_start = memdiff_search(bytes1, bytes2)
+    diff_offset = None
+    for offset, byte in enumerate(bytes1[diff_start:]):
+
+        if bytes2[diff_start + offset] != byte:
+            # Store offset if we're not tracking a diff
+            if diff_offset is None:
+                diff_offset = offset
+            continue
+
+        # Bytes match, check if this is the end of a diff
+        if diff_offset is not None:
+            diffs.append((diff_offset + diff_start, offset - diff_offset))
+            diff_offset = None
+
+            # Shortcut if remaining data is equal
+            if bytes1[diff_start + offset:] == bytes2[diff_start + offset:]:
+                break
+
+    # Bytes are different until the end of input, handle leftovers
+    if diff_offset is not None:
+        diffs.append((diff_offset + diff_start, offset + 1 - diff_offset))
+
+    return diffs
 
 
 def extract_decoding_contexts(vw, function):
@@ -52,13 +129,13 @@ def emulate_decoding_routine(vw, function_index, function, context):
     emu = makeEmulator(vw)
     emu.setEmuSnap(context.emu_snap)
     floss_logger.debug("Emulating function at 0x%08X called at 0x%08X, return address: 0x%08X",
-           function, context.decoded_at_va, context.return_address)
+                       function, context.decoded_at_va, context.return_address)
     deltas = decoding_manager.emulate_function(
-                emu,
-                function_index,
-                function,
-                context.return_address,
-                20000)
+        emu,
+        function_index,
+        function,
+        context.return_address,
+        20000)
     return deltas
 
 
@@ -95,32 +172,34 @@ def extract_delta_bytes(delta, decoded_at_va, source_fva=0x0):
     # iterate memory from after the decoding, since if somethings been allocated,
     # we want to know. don't care if things have been deallocated.
     for section_after_start, section_after in mem_after.items():
-        (_, _, _, bytes_after) = section_after
+        (_, _, (_, after_len, _, _), bytes_after) = section_after
         if section_after_start not in mem_before:
-            # TODO delta bytes instead of decoded strings
+            characteristics = {"location_type": LocationType.HEAP}
             delta_bytes.append(DecodedString(section_after_start, bytes_after,
-                                             decoded_at_va, source_fva, False))
+                                             decoded_at_va, source_fva, characteristics))
             continue
 
         section_before = mem_before[section_after_start]
-        (_, _, _, bytes_before) = section_before
+        (_, _, (_, before_len, _, _), bytes_before) = section_before
 
-        memory_diff = envi.memory.memdiff(bytes_before, bytes_after)
+        if after_len < before_len:
+            bytes_before = bytes_before[:after_len]
+
+        elif after_len > before_len:
+            bytes_before += "\x00" * (after_len - before_len)
+
+        memory_diff = memdiff(bytes_before, bytes_after)
         for offset, length in memory_diff:
             address = section_after_start + offset
 
-            if stack_start <= address <= sp:
-                # every stack address that exceeds the stack pointer can be
-                # ignored because it is local to child stack frame
-                continue
-
             diff_bytes = bytes_after[offset:offset + length]
-            global_address = False
             if not (stack_start <= address < stack_end):
                 # address is in global memory
-                global_address = address
+                characteristics = {"location_type": LocationType.GLOBAL}
+            else:
+                characteristics = {"location_type": LocationType.STACK}
             delta_bytes.append(DecodedString(address, diff_bytes, decoded_at_va,
-                                             source_fva, global_address))
+                                             source_fva, characteristics))
     return delta_bytes
 
 
@@ -135,16 +214,17 @@ def extract_strings(b):
     :rtype: Sequence[decoding_manager.DecodedString]
     '''
     ret = []
+    # ignore strings like: pVA, pVAAA, AAAA
+    # which come from vivisect uninitialized taint tracking
+    filter = re.compile("^p?V?A+$")
     for s in strings.extract_ascii_strings(b.s):
-        if s.s == "A" * len(s.s):
-            # ignore strings of all "A", which is likely taint data
+        if filter.match(s.s):
             continue
         ret.append(DecodedString(b.va + s.offset, s.s, b.decoded_at_va,
-                                 b.fva, b.global_address))
+                                 b.fva, b.characteristics))
     for s in strings.extract_unicode_strings(b.s):
-        if s.s == "A" * len(s.s):
+        if filter.match(s.s):
             continue
         ret.append(DecodedString(b.va + s.offset, s.s, b.decoded_at_va,
-                                 b.fva, b.global_address))
+                                 b.fva, b.characteristics))
     return ret
-

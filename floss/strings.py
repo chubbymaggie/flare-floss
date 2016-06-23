@@ -5,9 +5,19 @@ from collections import namedtuple
 ASCII_BYTE = " !\"#\$%&\'\(\)\*\+,-\./0123456789:;<=>\?@ABCDEFGHIJKLMNOPQRSTUVWXYZ\[\]\^_`abcdefghijklmnopqrstuvwxyz\{\|\}\\\~\t"
 ASCII_RE_4 = re.compile("([%s]{%d,})" % (ASCII_BYTE, 4))
 UNICODE_RE_4 = re.compile(b"((?:[%s]\x00){%d,})" % (ASCII_BYTE, 4))
-
+REPEATS = ["A", "\x00", "\xfe", "\xff"]
+SLICE_SIZE = 4096
 
 String = namedtuple("String", ["s", "offset"])
+
+
+def buf_filled_with(buf, character):
+    dupe_chunk = character * SLICE_SIZE
+    for offset in xrange(0, len(buf), SLICE_SIZE):
+        new_chunk = buf[offset: offset + SLICE_SIZE]
+        if dupe_chunk[:len(new_chunk)] != new_chunk:
+            return False
+    return True
 
 
 def extract_ascii_strings(buf, n=4):
@@ -20,6 +30,13 @@ def extract_ascii_strings(buf, n=4):
     :type n: int
     :rtype: Sequence[String]
     '''
+
+    if not buf:
+        return
+
+    if (buf[0] in REPEATS) and buf_filled_with(buf, buf[0]):
+        return
+
     r = None
     if n == 4:
         r = ASCII_RE_4
@@ -40,6 +57,13 @@ def extract_unicode_strings(buf, n=4):
     :type n: int
     :rtype: Sequence[String]
     '''
+
+    if not buf:
+        return
+
+    if (buf[0] in REPEATS) and buf_filled_with(buf, buf[0]):
+        return
+
     if n == 4:
         r = UNICODE_RE_4
     else:
