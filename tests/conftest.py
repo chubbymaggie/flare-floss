@@ -1,25 +1,24 @@
+# Copyright (C) 2017 FireEye, Inc. All Rights Reserved.
+
 import os
 import yaml
 import pytest
 
 import viv_utils
 
-import footer
 import floss.main as floss_main
 import floss.identification_manager as im
 import floss.stackstrings as stackstrings
 
 
-def extract_strings(sample_path):
+def extract_strings(vw):
     """
-    Deobfuscate strings from sample_path
+    Deobfuscate strings from vivisect workspace
     """
-    vw = viv_utils.getWorkspace(sample_path)
-    function_index = viv_utils.InstructionFunctionIndex(vw)
     decoding_functions_candidates = identify_decoding_functions(vw)
-    decoded_strings = floss_main.decode_strings(vw, function_index, decoding_functions_candidates)
+    decoded_strings = floss_main.decode_strings(vw, decoding_functions_candidates, 4)
     selected_functions = floss_main.select_functions(vw, None)
-    decoded_stackstrings = stackstrings.extract_stackstrings(vw, selected_functions)
+    decoded_stackstrings = stackstrings.extract_stackstrings(vw, selected_functions, 4)
     decoded_strings.extend(decoded_stackstrings)
     return [ds.s for ds in decoded_strings]
 
@@ -44,6 +43,18 @@ class YamlFile(pytest.File):
         test_dir = os.path.dirname(str(self.fspath))
         for platform, archs in spec["Output Files"].items():
             for arch, filename in archs.items():
+                # TODO specify max runtime via command line option
+                MAX_RUNTIME = 30.0
+                try:
+                    runtime_raw = spec["FLOSS running time"]
+                    runtime = float(runtime_raw.split(" ")[0])
+                    if runtime > MAX_RUNTIME:
+                        # skip this test
+                        continue
+                except KeyError:
+                    pass
+                except ValueError:
+                    pass
                 filepath = os.path.join(test_dir, filename)
                 if os.path.exists(filepath):
                     yield FLOSSTest(self, platform, arch, filename, spec)
@@ -78,27 +89,28 @@ class FLOSSTest(pytest.Item):
         self.filename = filename
 
     def _test_strings(self, test_path):
-        if footer.has_footer(test_path):
-            expected_strings = set(footer.read_footer(test_path)["all"])
-        else:
-            expected_strings = set(self.spec["Decoded strings"])
-
+        expected_strings = set(self.spec["Decoded strings"])
         if not expected_strings:
             return
 
-        found_strings = set(extract_strings(test_path))
+        test_shellcode = self.spec.get("Test shellcode")
+        if test_shellcode:
+            with open(test_path, "rb") as f:
+                shellcode_data = f.read()
+            vw = viv_utils.getShellcodeWorkspace(shellcode_data)  # TODO provide arch from test.yml
+            found_strings = set(extract_strings(vw))
+        else:
+            vw = viv_utils.getWorkspace(test_path)
+            found_strings = set(extract_strings(vw))
 
         if not (expected_strings <= found_strings):
             raise FLOSSStringsNotExtracted(expected_strings, found_strings)
 
     def _test_detection(self, test_path):
-        if footer.has_footer(test_path):
-            expected_functions = set(footer.read_footer(test_path).keys()) - set("all")
-        else:
-            try:
-                expected_functions = set(self.spec["Decoding routines"][self.platform][self.arch])
-            except KeyError:
-                expected_functions = set([])
+        try:
+            expected_functions = set(self.spec["Decoding routines"][self.platform][self.arch])
+        except KeyError:
+            expected_functions = set([])
 
         if not expected_functions:
             return
@@ -136,4 +148,6 @@ class FLOSSTest(pytest.Item):
                 "FLOSS extraction failed:",
                 "   expected: %s" % str(expected),
                 "   got: %s" % str(got),
+                "   expected-got: %s" % str(set(expected)-set(got)),
+                "   got-expected: %s" % str(set(got) - set(expected)),
             ])

@@ -1,9 +1,11 @@
+# Copyright (C) 2017 FireEye, Inc. All Rights Reserved.
+
 import re
 import logging
 
 import strings
 import decoding_manager
-from utils import makeEmulator
+from utils import makeEmulator, is_fp_string, strip_string, MAX_STRING_LENGTH
 from function_argument_getter import get_function_contexts
 from decoding_manager import DecodedString, LocationType
 
@@ -203,7 +205,7 @@ def extract_delta_bytes(delta, decoded_at_va, source_fva=0x0):
     return delta_bytes
 
 
-def extract_strings(b):
+def extract_strings(b, min_length, no_filter):
     '''
     Extract the ASCII and UTF-16 strings from a bytestring.
 
@@ -211,20 +213,35 @@ def extract_strings(b):
     :param b: The data from which to extract the strings. Note its a
       DecodedString instance that tracks extra metadata beyond the
       bytestring contents.
+    :param min_length: minimum string length
+    :param no_filter: do not filter decoded strings
     :rtype: Sequence[decoding_manager.DecodedString]
     '''
     ret = []
-    # ignore strings like: pVA, pVAAA, AAAA
-    # which come from vivisect uninitialized taint tracking
-    filter = re.compile("^p?V?A+$")
     for s in strings.extract_ascii_strings(b.s):
-        if filter.match(s.s):
+        if len(s.s) > MAX_STRING_LENGTH:
             continue
-        ret.append(DecodedString(b.va + s.offset, s.s, b.decoded_at_va,
-                                 b.fva, b.characteristics))
+
+        if no_filter:
+            decoded_string = s.s
+        elif not is_fp_string(s.s):
+            decoded_string = strip_string(s.s)
+        else:
+            continue
+
+        if len(decoded_string) >= min_length:
+            ret.append(DecodedString(b.va + s.offset, decoded_string, b.decoded_at_va, b.fva, b.characteristics))
     for s in strings.extract_unicode_strings(b.s):
-        if filter.match(s.s):
+        if len(s.s) > MAX_STRING_LENGTH:
             continue
-        ret.append(DecodedString(b.va + s.offset, s.s, b.decoded_at_va,
-                                 b.fva, b.characteristics))
+
+        if no_filter:
+            decoded_string = s.s
+        elif not is_fp_string(s.s):
+            decoded_string = strip_string(s.s)
+        else:
+            continue
+
+        if len(decoded_string) >= min_length:
+            ret.append(DecodedString(b.va + s.offset, decoded_string, b.decoded_at_va, b.fva, b.characteristics))
     return ret

@@ -1,3 +1,5 @@
+# Copyright (C) 2017 FireEye, Inc. All Rights Reserved.
+
 import contextlib
 
 import envi
@@ -45,7 +47,9 @@ class ApiMonitor(viv_utils.emulator_drivers.Monitor):
 
         return_address = self.getStackValue(emu, -4)
         if return_address not in return_addresses:
-            self._logger.debug("Return address 0x%08X is invalid", return_address)
+            self._logger.debug("Return address 0x%08X is invalid, expected one of: %s",
+                               return_address,
+                               ', '.join(map(hex, return_addresses)))
             self._fix_return(emu, return_address, return_addresses)
             # TODO return, handle Exception
         else:
@@ -163,13 +167,13 @@ class RtlAllocateHeapHook(viv_utils.emulator_drivers.Hook):
     '''
     Hook calls to RtlAllocateHeap, allocate memory in a "heap"
      section, and return pointers to this memory.
-    The base heap address is 0x69690000.
+    The base heap address is 0x96960000.
     The max allocation size is 10 MB.
     '''
 
     def __init__(self, *args, **kwargs):
         super(RtlAllocateHeapHook, self).__init__(*args, **kwargs)
-        self._heap_addr = 0x69690000
+        self._heap_addr = 0x96960000
 
     MAX_ALLOCATION_SIZE = 10 * 1024 * 1024
 
@@ -237,7 +241,7 @@ class MallocHeap(RtlAllocateHeapHook):
 
 class MemcpyHook(viv_utils.emulator_drivers.Hook):
     '''
-    Hook and handle calls to memcpy.
+    Hook and handle calls to memcpy and memmove.
     '''
     MAX_COPY_SIZE = 1024 * 1024 * 32  # don't attempt to copy more than 32MB, or something is wrong
 
@@ -245,7 +249,8 @@ class MemcpyHook(viv_utils.emulator_drivers.Hook):
         super(MemcpyHook, self).__init__(*args, **kwargs)
 
     def hook(self, callname, driver, callconv, api, argv):
-        if callname == "msvcrt.memcpy":
+        if callname == "msvcrt.memcpy" or \
+           callname == "msvcrt.memmove":
             emu = driver
             dst, src, count = argv
             if count > self.MAX_COPY_SIZE:
@@ -258,6 +263,26 @@ class MemcpyHook(viv_utils.emulator_drivers.Hook):
         raise viv_utils.emulator_drivers.UnsupportedFunction()
 
 
+def readStringAtRva(emu, rva, maxsize=None):
+    """
+    Borrowed from vivisect/PE/__init__.py
+    :param emu: emulator
+    :param rva: virtual address of string
+    :param maxsize: maxsize of string
+    :return: the read string
+    """
+    ret = []
+    while True:
+        if maxsize and maxsize <= len(ret):
+            break
+        x = emu.readMemory(rva, 1)
+        if x == '\x00' or x is None:
+            break
+        ret.append(x)
+        rva += 1
+    return ''.join(ret)
+
+
 class StrlenHook(viv_utils.emulator_drivers.Hook):
     """
     Hook and handle calls to strlen
@@ -267,32 +292,68 @@ class StrlenHook(viv_utils.emulator_drivers.Hook):
         super(StrlenHook, self).__init__(*args, **kwargs)
 
     def hook(self, callname, driver, callconv, api, argv):
-        if callname == "msvcrt.strlen":
+        if callname and callname.lower() in ["msvcrt.strlen", "kernel32.lstrlena"]:
             emu = driver
             string_va = argv[0]
-            s = self.readStringAtRva(emu, string_va, 256)
+            s = readStringAtRva(emu, string_va, 256)
             callconv.execCallReturn(emu, len(s), len(argv))
             return True
         raise viv_utils.emulator_drivers.UnsupportedFunction()
 
-    def readStringAtRva(self, emu, rva, maxsize=None):
-        """
-        Borrowed from vivisect/PE/__init__.py
-        :param emu: emulator
-        :param rva: virtual address of string
-        :param maxsize: maxsize of string
-        :return: the read string
-        """
-        ret = ''
-        while True:
-            if maxsize and maxsize <= len(ret):
-                break
-            x = emu.readMemory(rva, 1)
-            if x == '\x00' or x is None:
-                break
-            ret += x
-            rva += 1
-        return ret
+
+class StrnlenHook(viv_utils.emulator_drivers.Hook):
+    '''
+    Hook and handle calls to strnlen.
+    '''
+    MAX_COPY_SIZE = 1024 * 1024 * 32
+
+    def __init__(self, *args, **kwargs):
+        super(StrnlenHook, self).__init__(*args, **kwargs)
+
+    def hook(self, callname, driver, callconv, api, argv):
+        if callname == "msvcrt.strnlen":
+            emu = driver
+            string_va, maxlen = argv
+            if maxlen > self.MAX_COPY_SIZE:
+                self.d('unusually large strnlen, truncating to 32MB: 0x%x', maxlen)
+                maxlen = self.MAX_COPY_SIZE
+            s = readStringAtRva(emu, string_va, maxsize=maxlen)
+            slen = len(s.partition('\x00')[0])
+            callconv.execCallReturn(emu, slen, len(argv))
+            return True
+
+        raise viv_utils.emulator_drivers.UnsupportedFunction()
+
+
+class StrncmpHook(viv_utils.emulator_drivers.Hook):
+    '''
+    Hook and handle calls to strncmp.
+    '''
+    MAX_COPY_SIZE = 1024 * 1024 * 32
+
+    def __init__(self, *args, **kwargs):
+        super(StrncmpHook, self).__init__(*args, **kwargs)
+
+    def hook(self, callname, driver, callconv, api, argv):
+        if callname == "msvcrt.strncmp":
+            emu = driver
+            s1va, s2va, num = argv
+            if num > self.MAX_COPY_SIZE:
+                self.d('unusually large strnlen, truncating to 32MB: 0x%x', num)
+                num = self.MAX_COPY_SIZE
+
+            s1 = readStringAtRva(emu, s1va, maxsize=num)
+            s2 = readStringAtRva(emu, s2va, maxsize=num)
+
+            s1 = s1.partition('\x00')[0]
+            s2 = s2.partition('\x00')[0]
+
+            result = cmp(s1, s2)
+
+            callconv.execCallReturn(emu, result, len(argv))
+            return True
+
+        raise viv_utils.emulator_drivers.UnsupportedFunction()
 
 
 class MemchrHook(viv_utils.emulator_drivers.Hook):
@@ -331,6 +392,19 @@ class ExitProcessHook(viv_utils.emulator_drivers.Hook):
             raise viv_utils.emulator_drivers.StopEmulation()
 
 
+class CriticalSectionHooks(viv_utils.emulator_drivers.Hook):
+    '''
+    Hook calls to:
+      - InitializeCriticalSection
+    '''
+    def hook(self, callname, emu, callconv, api, argv):
+        if callname == "kernel32.InitializeCriticalSection":
+            hsection, = argv
+            emu.writeMemory(hsection, "csec")
+            callconv.execCallReturn(emu, 0, len(argv))
+            return True
+
+
 DEFAULT_HOOKS = [
     GetProcessHeapHook(),
     RtlAllocateHeapHook(),
@@ -340,6 +414,9 @@ DEFAULT_HOOKS = [
     MemcpyHook(),
     StrlenHook(),
     MemchrHook(),
+    StrnlenHook(),
+    StrncmpHook(),
+    CriticalSectionHooks(),
 ]
 
 

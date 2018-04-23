@@ -1,1 +1,2 @@
-__version__ = '1.3.0'
+# Copyright (C) 2017 FireEye, Inc. All Rights Reserved.
+__version__ = '1.5.1'
