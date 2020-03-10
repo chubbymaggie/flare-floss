@@ -55,21 +55,23 @@ def hex(i):
     return "0x%X" % (i)
 
 
-def decode_strings(vw, decoding_functions_candidates, min_length, no_filter=False):
+def decode_strings(vw, decoding_functions_candidates, min_length, no_filter=False, max_instruction_count=20000, max_hits=1):
     """
     FLOSS string decoding algorithm
     :param vw: vivisect workspace
     :param decoding_functions_candidates: identification manager
     :param min_length: minimum string length
     :param no_filter: do not filter decoded strings
+    :param max_instruction_count: The maximum number of instructions to emulate per function.
+    :param max_hits: The maximum number of hits per address
     :return: list of decoded strings ([DecodedString])
     """
     decoded_strings = []
     function_index = viv_utils.InstructionFunctionIndex(vw)
     # TODO pass function list instead of identification manager
     for fva, _ in decoding_functions_candidates.get_top_candidate_functions(10):
-        for ctx in string_decoder.extract_decoding_contexts(vw, fva):
-            for delta in string_decoder.emulate_decoding_routine(vw, function_index, fva, ctx):
+        for ctx in string_decoder.extract_decoding_contexts(vw, fva, max_hits):
+            for delta in string_decoder.emulate_decoding_routine(vw, function_index, fva, ctx, max_instruction_count):
                 for delta_bytes in string_decoder.extract_delta_bytes(delta, ctx.decoded_at_va, fva):
                     for decoded_string in string_decoder.extract_strings(delta_bytes, min_length, no_filter):
                         decoded_strings.append(decoded_string)
@@ -144,6 +146,10 @@ def make_parser():
     parser.add_option("--no-filter", dest="no_filter",
                       help="do not filter deobfuscated strings (may result in many false positive strings)",
                       action="store_true")
+    parser.add_option("--max-instruction-count", dest="max_instruction_count", type=int, default=20000,
+                      help="maximum number of instructions to emulate per function (default is 20000)")
+    parser.add_option("--max-address-revisits", dest="max_address_revisits", type=int, default=0,
+                      help="maximum number of address revisits per function (default is 0)")
 
     shellcode_group = OptionGroup(parser, "Shellcode options", "Analyze raw binary file containing shellcode")
     shellcode_group.add_option("-s", "--shellcode", dest="is_shellcode", help="analyze shellcode",
@@ -186,6 +192,8 @@ def make_parser():
                             help="create a x64dbg database/json file to annotate the decoded strings in x64dbg")
     output_group.add_option("-r", "--radare", dest="radare2_script_file",
                             help="create a radare2 script to annotate the decoded strings in an .r2 file")
+    output_group.add_option("-j", "--binja", dest="binja_script_file",
+                            help="create a Binary Ninja script to annotate the decoded strings in a BNDB file")
     parser.add_option_group(output_group)
 
     identification_group = OptionGroup(parser, "Identification Options")
@@ -205,7 +213,116 @@ def make_parser():
     return parser
 
 
-def set_logging_level(should_debug=False, should_verbose=False):
+def set_logging_levels(should_debug=False, should_verbose=False):
+    """
+    Sets the logging levels of each of Floss's loggers individually.
+    Recomended to use if Floss is being used as a library, and your
+    project has its own logging set up. If both parameters 'should_debug'
+    and 'should_verbose' are false, the logging level will be set to ERROR.
+    :param should_debug: set logging level to DEBUG
+    :param should_verbose: set logging level to INFO
+    """
+    log_level = None
+    emulator_driver_level = None
+
+    if should_debug:
+        log_level = logging.DEBUG
+        emulator_driver_level = log_level
+
+    elif should_verbose:
+        log_level = logging.INFO
+        emulator_driver_level = log_level
+    else:
+        log_level = logging.ERROR
+        emulator_driver_level = logging.CRITICAL
+
+    # ignore messages like:
+    # DEBUG: mapping section: 0 .text
+    logging.getLogger("vivisect.parsers.pe").setLevel(log_level)
+
+    # ignore messages like:
+    # WARNING:EmulatorDriver:error during emulation of function: BreakpointHit at 0x1001fbfb
+    # ERROR:EmulatorDriver:error during emulation of function ... DivideByZero: DivideByZero at 0x10004940
+    # TODO: probably should modify emulator driver to de-prioritize this
+    logging.getLogger("EmulatorDriver").setLevel(emulator_driver_level)
+
+    # ignore messages like:
+    # WARNING:Monitor:logAnomaly: anomaly: BreakpointHit at 0x1001fbfb
+    logging.getLogger("Monitor").setLevel(log_level)
+
+    # ignore messages like:
+    # WARNING:envi/codeflow.addCodeFlow:parseOpcode error at 0x1001044c: InvalidInstruction("'660f3a0fd90c660f7f1f660f6fe0660f' at 0x1001044c",)
+    logging.getLogger("envi/codeflow.addCodeFlow").setLevel(log_level)
+
+    # ignore messages like:
+    # WARNING:vtrace.platforms.win32:LoadLibrary C:\Users\USERNA~1\AppData\Local\Temp\_MEI21~1\vtrace\platforms\windll\amd64\symsrv.dll: [Error 126] The specified module could not be found
+    # WARNING:vtrace.platforms.win32:LoadLibrary C:\Users\USERNA~1\AppData\Local\Temp\_MEI21~1\vtrace\platforms\windll\amd64\dbghelp.dll: [Error 126] The specified module could not be found
+    logging.getLogger("vtrace.platforms.win32").setLevel(log_level)
+
+    # ignore messages like:
+    # DEBUG: merge_candidates: Function at 0x00401500 is new, adding
+    logging.getLogger("floss.identification_manager.IdentificationManager").setLevel(log_level)
+
+    # ignore messages like:
+    # WARNING: get_caller_vas: unknown caller function: 0x403441
+    # DEBUG: get_all_function_contexts: Getting function context for function at 0x00401500...
+    logging.getLogger("floss.function_argument_getter.FunctionArgumentGetter").setLevel(log_level)
+
+    # ignore messages like:
+    # DEBUG: Emulating function at 0x004017A9 called at 0x00401644, return address: 0x00401649
+    logging.getLogger("floss").setLevel(log_level)
+
+    # ignore messages like:
+    # DEBUG: extracting stackstrings at checkpoint: 0x4048dd stacksize: 0x58
+    logging.getLogger("floss.stackstrings").setLevel(log_level)
+
+    # ignore messages like:
+    # WARNING:plugins.arithmetic_plugin.XORPlugin:identify: Invalid instruction encountered in basic block, skipping: 0x4a0637
+    logging.getLogger("floss.plugins.arithmetic_plugin.XORPlugin").setLevel(log_level)
+    logging.getLogger("floss.plugins.arithmetic_plugin.ShiftPlugin").setLevel(log_level)
+
+    # ignore messages like:
+    # DEBUG: identify: Identified WSAStartup_00401476 at VA 0x00401476
+    logging.getLogger("floss.plugins.library_function_plugin.FunctionIsLibraryPlugin").setLevel(log_level)
+
+    # ignore messages like:
+    # DEBUG: identify: Function at 0x00401500: Cross references to: 2
+    logging.getLogger("floss.plugins.function_meta_data_plugin.FunctionCrossReferencesToPlugin").setLevel(log_level)
+
+    # ignore messages like:
+    # DEBUG: identify: Function at 0x00401FFF: Number of arguments: 3
+    logging.getLogger("floss.plugins.function_meta_data_plugin.FunctionArgumentCountPlugin").setLevel(log_level)
+
+    # ignore messages like:
+    # DEBUG: get_meta_data: Function at 0x00401470 has meta data: Thunk: ws2_32.WSACleanup
+    logging.getLogger("floss.plugins.function_meta_data_plugin.FunctionIsThunkPlugin").setLevel(log_level)
+
+    # ignore messages like:
+    # DEBUG: get_meta_data: Function at 0x00401000 has meta data: BlockCount: 7
+    logging.getLogger("floss.plugins.function_meta_data_plugin.FunctionBlockCountPlugin").setLevel(log_level)
+
+    # ignore messages like:
+    # DEBUG: get_meta_data: Function at 0x00401000 has meta data: InstructionCount: 60
+    logging.getLogger("floss.plugins.function_meta_data_plugin.FunctionInstructionCountPlugin").setLevel(log_level)
+
+    # ignore messages like:
+    # DEBUG: get_meta_data: Function at 0x00401000 has meta data: Size: 177
+    logging.getLogger("floss.plugins.function_meta_data_plugin.FunctionSizePlugin").setLevel(log_level)
+
+    # ignore messages like:
+    # DEBUG: identify: suspicious MOV instruction at 0x00401017 in function 0x00401000: mov byte [edx],al
+    logging.getLogger("floss.plugins.mov_plugin.MovPlugin").setLevel(log_level)
+
+
+def set_log_config(should_debug=False, should_verbose=False):
+    """
+    Removes root logging handlers, and sets Floss's logging level.
+    Recomended to use if Floss is being used in a standalone script, or
+    your project doesn't have any loggers. If both parameters 'should_debug'
+    and 'should_verbose' are false, the logging level will be set to ERROR.
+    :param should_debug: set logging level to DEBUG
+    :param should_verbose: set logging level to INFO
+    """
     # reset .basicConfig root handler
     # via: http://stackoverflow.com/a/2588054
     root = logging.getLogger()
@@ -220,30 +337,7 @@ def set_logging_level(should_debug=False, should_verbose=False):
     else:
         logging.basicConfig(level=logging.WARNING)
 
-        # ignore messages like:
-        # WARNING:EmulatorDriver:error during emulation of function: BreakpointHit at 0x1001fbfb
-        # ERROR:EmulatorDriver:error during emulation of function ... DivideByZero: DivideByZero at 0x10004940
-        # TODO: probably should modify emulator driver to de-prioritize this
-        logging.getLogger("EmulatorDriver").setLevel(logging.CRITICAL)
-
-        # ignore messages like:
-        # WARNING:Monitor:logAnomaly: anomaly: BreakpointHit at 0x1001fbfb
-        logging.getLogger("Monitor").setLevel(logging.ERROR)
-
-        # ignore messages like:
-        # WARNING:envi/codeflow.addCodeFlow:parseOpcode error at 0x1001044c: InvalidInstruction("'660f3a0fd90c660f7f1f660f6fe0660f' at 0x1001044c",)
-        logging.getLogger("envi/codeflow.addCodeFlow").setLevel(logging.ERROR)
-
-
-        # ignore messages like:
-        # WARNING:vtrace.platforms.win32:LoadLibrary C:\Users\USERNA~1\AppData\Local\Temp\_MEI21~1\vtrace\platforms\windll\amd64\symsrv.dll: [Error 126] The specified module could not be found
-        # WARNING:vtrace.platforms.win32:LoadLibrary C:\Users\USERNA~1\AppData\Local\Temp\_MEI21~1\vtrace\platforms\windll\amd64\dbghelp.dll: [Error 126] The specified module could not be found
-        logging.getLogger('vtrace.platforms.win32').setLevel(logging.ERROR)
-
-        # ignore messages like:
-        # WARNING:plugins.arithmetic_plugin.XORPlugin:identify: Invalid instruction encountered in basic block, skipping: 0x4a0637
-        logging.getLogger("floss.plugins.arithmetic_plugin.XORPlugin").setLevel(logging.ERROR)
-        logging.getLogger("floss.plugins.arithmetic_plugin.ShiftPlugin").setLevel(logging.ERROR)
+    set_logging_levels(should_debug, should_verbose)
 
 
 def parse_functions_option(functions_option):
@@ -332,7 +426,7 @@ def filter_unique_decoded(decoded_strings):
     unique_values = set()
     originals = []
     for decoded in decoded_strings:
-        hashable = (decoded.va, decoded.s, decoded.decoded_at_va, decoded.fva)
+        hashable = (decoded.s, decoded.decoded_at_va, decoded.fva)
         if hashable not in unique_values:
             unique_values.add(hashable)
             originals.append(decoded)
@@ -398,10 +492,10 @@ def print_decoding_results(decoded_strings, group_functions, quiet=False, expert
     :param quiet: print strings only, suppresses headers
     :param expert: expert mode
     """
-    if not quiet:
-        print("\nFLOSS decoded %d strings" % len(decoded_strings))
 
     if group_functions:
+        if not quiet:
+            print("\nFLOSS decoded %d strings" % len(decoded_strings))
         fvas = set(map(lambda i: i.fva, decoded_strings))
         for fva in fvas:
             grouped_strings = filter(lambda ds: ds.fva == fva, decoded_strings)
@@ -411,6 +505,12 @@ def print_decoding_results(decoded_strings, group_functions, quiet=False, expert
                     print("\nDecoding function at 0x%X (decoded %d strings)" % (fva, len_ds))
                 print_decoded_strings(grouped_strings, quiet=quiet, expert=expert)
     else:
+        if not expert:
+            seen = set()
+            decoded_strings = [x for x in decoded_strings if not (x.s in seen or seen.add(x.s))]
+        if not quiet:
+            print("\nFLOSS decoded %d strings" % len(decoded_strings))
+
         print_decoded_strings(decoded_strings, quiet=quiet, expert=expert)
 
 
@@ -460,13 +560,13 @@ def create_x64dbg_database_content(sample_file_path, imagebase, decoded_strings)
                 rva = hex(ds.va - imagebase)
                 try:
                     processed[rva] += "\t" + sanitized_string
-                except:
+                except BaseException:
                     processed[rva] = "FLOSS: " + sanitized_string
             else:
                 rva = hex(ds.decoded_at_va - imagebase)
                 try:
                     processed[rva] += "\t" + sanitized_string
-                except:
+                except BaseException:
                     processed[rva] = "FLOSS: " + sanitized_string
 
     for i in processed.keys():
@@ -560,6 +660,85 @@ if __name__ == "__main__":
     return script_content
 
 
+def create_binja_script_content(sample_file_path, decoded_strings, stack_strings):
+    """
+    Create Binary Ninja script contents for BNDB file annotations.
+    :param sample_file_path: input file path
+    :param decoded_strings: list of decoded strings ([DecodedString])
+    :param stack_strings: list of stack strings ([StackString])
+    :return: content of the Binary Ninja script
+    """
+    main_commands = []
+    for ds in decoded_strings:
+        if ds.s != "":
+            sanitized_string = sanitize_string_for_script(ds.s)
+            if ds.characteristics["location_type"] == LocationType.GLOBAL:
+                main_commands.append("print \"FLOSS: string \\\"%s\\\" at global VA 0x%X\"" % (sanitized_string, ds.va))
+                main_commands.append("AppendComment(%d, \"FLOSS: %s\")" % (ds.va, sanitized_string))
+            else:
+                main_commands.append("print \"FLOSS: string \\\"%s\\\" decoded at VA 0x%X\"" % (sanitized_string, ds.decoded_at_va))
+                main_commands.append("AppendComment(%d, \"FLOSS: %s\")" % (ds.decoded_at_va, sanitized_string))
+    main_commands.append("print \"Imported decoded strings from FLOSS\"")
+
+    ss_len = 0
+    for ss in stack_strings:
+        if ss.s != "":
+            sanitized_string = sanitize_string_for_script(ss.s)
+            main_commands.append("AppendLvarComment(%d, %d, \"FLOSS stackstring: %s\")" % (ss.fva, ss.pc, sanitized_string))
+            ss_len += 1
+    main_commands.append("print \"Imported stackstrings from FLOSS\"")
+
+    script_content = """import binaryninja as bn
+
+
+def AppendComment(ea, s):
+
+    s = s.encode('ascii')
+    refAddrs = []
+    for ref in bv.get_code_refs(ea):
+        refAddrs.append(ref)
+
+    for addr in refAddrs:
+        fnc = bv.get_functions_containing(addr.address)
+        fn = fnc[0]
+
+        string = fn.get_comment_at(addr.address)
+
+        if not string:
+            string = s  # no existing comment
+        else:
+            if s in string:  # ignore duplicates
+                return
+            string = string + "\\n" + s
+
+        fn.set_comment_at(addr.address, string)
+
+def AppendLvarComment(fva, pc, s):
+
+    # stack var comments are not a thing in Binary Ninja so just add at top of function
+    # and at location where it's used as an arg
+    s = s.encode('ascii')
+    fn = bv.get_function_at(fva)
+
+    for addr in [fva, pc]:
+        string = fn.get_comment_at(addr)
+
+        if not string:
+            string = s
+        else:
+            if s in string:  # ignore duplicates
+                return
+            string = string + "\\n" + s
+
+        fn.set_comment(addr, string)
+
+print "Annotating %d strings from FLOSS for %s"
+%s
+
+""" % (len(decoded_strings) + ss_len, sample_file_path, "\n".join(main_commands))
+    return script_content
+
+
 def create_r2_script_content(sample_file_path, decoded_strings, stack_strings):
     """
     Create r2script contents for r2 session annotations.
@@ -607,7 +786,7 @@ def create_x64dbg_database(sample_file_path, x64dbg_database_file, imagebase, de
     with open(x64dbg_database_file, 'wb') as f:
         try:
             f.write(script_content)
-            print("Wrote x64dbg database to %s\n" % x64dbg_database_file)
+            floss_logger.info("Wrote x64dbg database to %s\n" % x64dbg_database_file)
         except Exception as e:
             raise e
 
@@ -625,7 +804,26 @@ def create_ida_script(sample_file_path, ida_python_file, decoded_strings, stack_
     with open(ida_python_file, 'wb') as f:
         try:
             f.write(script_content)
-            print("Wrote IDAPython script file to %s\n" % ida_python_file)
+            floss_logger.info("Wrote IDAPython script file to %s\n" % ida_python_file)
+        except Exception as e:
+            raise e
+    # TODO return, catch exception in main()
+
+
+def create_binja_script(sample_file_path, binja_script_file, decoded_strings, stack_strings):
+    """
+    Create a Binary Ninja script to annotate a BNDB file with decoded strings.
+    :param sample_file_path: input file path
+    :param binja_script_file: output file path
+    :param decoded_strings: list of decoded strings ([DecodedString])
+    :param stack_strings: list of stack strings ([StackString])
+    """
+    script_content = create_binja_script_content(sample_file_path, decoded_strings, stack_strings)
+    binja_script__file = os.path.abspath(binja_script_file)
+    with open(binja_script_file, 'wb') as f:
+        try:
+            f.write(script_content)
+            floss_logger.info("Wrote Binary Ninja script file to %s\n" % binja_script_file)
         except Exception as e:
             raise e
     # TODO return, catch exception in main()
@@ -644,7 +842,7 @@ def create_r2_script(sample_file_path, r2_script_file, decoded_strings, stack_st
     with open(r2_script_file, 'wb') as f:
         try:
             f.write(script_content)
-            print("Wrote radare2script file to %s\n" % r2_script_file)
+            floss_logger.info("Wrote radare2script file to %s\n" % r2_script_file)
         except Exception as e:
             raise e
     # TODO return, catch exception in main()
@@ -677,7 +875,7 @@ def print_static_strings(path, min_length, quiet=False):
             if not quiet:
                 print("")
 
-            if os.path.getsize(path) > sys.maxint:
+            if os.path.getsize(path) > sys.maxsize:
                 floss_logger.warning("File too large, strings listings may be truncated.")
                 floss_logger.warning("FLOSS cannot handle files larger than 4GB on 32bit systems.")
 
@@ -724,7 +922,7 @@ def print_file_meta_info(vw, selected_functions):
     try:
         for k, v in get_vivisect_meta_info(vw, selected_functions).iteritems():
             print("%s: %s" % (k, v or "N/A"))  # display N/A if value is None
-    except Exception, e:
+    except Exception as e:
         floss_logger.error("Failed to print vivisect analysis information: {0}".format(e.message))
 
 
@@ -770,10 +968,10 @@ def load_vw(sample_file_path, save_workspace, verbose, is_shellcode, shellcode_e
             return load_workspace(sample_file_path, save_workspace)
         else:
             return load_shellcode_workspace(sample_file_path, save_workspace, shellcode_entry_point, shellcode_base)
-    except LoadNotSupportedError, e:
+    except LoadNotSupportedError as e:
         floss_logger.error(str(e))
         raise WorkspaceLoadError
-    except Exception, e:
+    except Exception as e:
         floss_logger.error("Vivisect failed to load the input file: {0}".format(e.message), exc_info=verbose)
         raise WorkspaceLoadError
 
@@ -791,7 +989,7 @@ def main(argv=None):
     else:
         options, args = parser.parse_args()
 
-    set_logging_level(options.debug, options.verbose)
+    set_log_config(options.debug, options.verbose)
 
     if options.list_plugins:
         print_plugin_list()
@@ -853,7 +1051,10 @@ def main(argv=None):
             print_identification_results(sample_file_path, decoding_functions_candidates)
 
         floss_logger.info("Decoding strings...")
-        decoded_strings = decode_strings(vw, decoding_functions_candidates, min_length, options.no_filter)
+        decoded_strings = decode_strings(vw, decoding_functions_candidates, min_length, options.no_filter,
+                                         options.max_instruction_count, options.max_address_revisits + 1)
+        # TODO: The de-duplication process isn't perfect as it is done here and in print_decoding_results and
+        # TODO: all of them on non-sanitized strings.
         if not options.expert:
             decoded_strings = filter_unique_decoded(decoded_strings)
         print_decoding_results(decoded_strings, options.group_functions, quiet=options.quiet, expert=options.expert)
@@ -883,6 +1084,10 @@ def main(argv=None):
     if options.radare2_script_file:
         floss_logger.info("Creating r2script...")
         create_r2_script(sample_file_path, options.radare2_script_file, decoded_strings, stack_strings)
+
+    if options.binja_script_file:
+        floss_logger.info("Creating Binary Ninja script...")
+        create_binja_script(sample_file_path, options.binja_script_file, decoded_strings, stack_strings)
 
     time1 = time()
     if not options.quiet:

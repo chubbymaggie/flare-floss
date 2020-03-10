@@ -145,7 +145,7 @@ class GetProcessHeapHook(viv_utils.emulator_drivers.Hook):
     def hook(self, callname, emu, callconv, api, argv):
         if callname == "kernel32.GetProcessHeap":
             # nop
-            callconv.execCallReturn(emu, 0, len(argv))
+            callconv.execCallReturn(emu, 42, len(argv))
             return True
         raise viv_utils.emulator_drivers.UnsupportedFunction()
 
@@ -160,7 +160,7 @@ def round(i, size):
     '''
     if i % size == 0:
         return i
-    return i + (i - (i % size))
+    return i + (size - (i % size))
 
 
 class RtlAllocateHeapHook(viv_utils.emulator_drivers.Hook):
@@ -397,6 +397,7 @@ class CriticalSectionHooks(viv_utils.emulator_drivers.Hook):
     Hook calls to:
       - InitializeCriticalSection
     '''
+
     def hook(self, callname, emu, callconv, api, argv):
         if callname == "kernel32.InitializeCriticalSection":
             hsection, = argv

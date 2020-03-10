@@ -91,7 +91,7 @@ def memdiff(bytes1, bytes2):
     return diffs
 
 
-def extract_decoding_contexts(vw, function):
+def extract_decoding_contexts(vw, function, max_hits):
     '''
     Extract the CPU and memory contexts of all calls to the given function.
     Under the hood, we brute-force emulate all code paths to extract the
@@ -101,12 +101,13 @@ def extract_decoding_contexts(vw, function):
     :param vw: The vivisect workspace in which the function is defined.
     :type function: int
     :param function: The address of the function whose contexts we'll find.
+    :param max_hits: The maximum number of hits per address
     :rtype: Sequence[function_argument_getter.FunctionContext]
     '''
-    return get_function_contexts(vw, function)
+    return get_function_contexts(vw, function, max_hits)
 
 
-def emulate_decoding_routine(vw, function_index, function, context):
+def emulate_decoding_routine(vw, function_index, function, context, max_instruction_count):
     '''
     Emulate a function with a given context and extract the CPU and
      memory contexts at interesting points during emulation.
@@ -126,6 +127,8 @@ def emulate_decoding_routine(vw, function_index, function, context):
     :type context: funtion_argument_getter.FunctionContext
     :param context: The initial state of the CPU and memory
       prior to the function being called.
+    :type max_instruction_count: int
+    :param max_instruction_count: The maximum number of instructions to emulate per function.
     :rtype: Sequence[decoding_manager.Delta]
     '''
     emu = makeEmulator(vw)
@@ -137,7 +140,7 @@ def emulate_decoding_routine(vw, function_index, function, context):
         function_index,
         function,
         context.return_address,
-        20000)
+        max_instruction_count)
     return deltas
 
 
